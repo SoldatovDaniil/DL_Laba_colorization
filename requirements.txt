@@ -4,3 +4,4 @@ scikit-image>=0.18.0
 numpy>=1.19.0
 matplotlib>=3.3.0
 Pillow>=8.0.0
+ipython>=7.0.0

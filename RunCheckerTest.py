@@ -9,14 +9,23 @@ matplotlib.use('Agg')
 
 from colorizers import eccv16, siggraph17, load_img, preprocess_img, postprocess_tens
 
-# Fixed seed for reproducibility
+# Фиксированный seed. Сами модели в eval() детерминированы,
+# seed страхует от случайности в окружении/предобработке.
 SEED = 42
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
-TEST_IMAGE = 'imgs/ansel_adams3.jpg'
-PSNR_THRESHOLD = 18.0
-SSIM_THRESHOLD = 0.55
+# Цветные изображения из ImageNet val: оригинал служит эталоном,
+# на вход модели подаётся только канал яркости L.
+TEST_IMAGES = [
+    'imgs/ILSVRC2012_val_00041580.JPEG',
+    'imgs/ILSVRC2012_val_00046524.JPEG',
+    'imgs/ILSVRC2012_val_00046834.JPEG',
+]
+PSNR_THRESHOLD = 18.0        # средний PSNR (дБ) по RGB относительно цветного оригинала
+SSIM_THRESHOLD = 0.75        # средний SSIM по RGB относительно цветного оригинала
+AB_GAIN_THRESHOLD = 0.25     # ошибка по ab должна быть хотя бы на 25% меньше, чем у серого baseline
+SATURATION_THRESHOLD = 5.0   # средний |ab| выхода: модель действительно добавляет цвет
 
 
 def load_models():
@@ -31,9 +40,22 @@ def colorize(model, tens_l_orig, tens_l_rs):
     return postprocess_tens(tens_l_orig, ab_pred)
 
 
-def to_grayscale_rgb(img_rgb):
-    gray = color.rgb2gray(img_rgb)
-    return np.stack([gray, gray, gray], axis=-1)
+def gray_baseline(tens_l_orig):
+    # "Модель", которая ничего не раскрашивает: ab = 0
+    return postprocess_tens(tens_l_orig, torch.zeros(1, 2, *tens_l_orig.shape[2:]))
+
+
+def evaluate(img_rgb, out_rgb):
+    # img_rgb: uint8 оригинал, out_rgb: float [0, 1] результат колоризации
+    orig = img_rgb.astype(np.float64) / 255.0
+    ab_orig = color.rgb2lab(img_rgb)[..., 1:]
+    ab_out = color.rgb2lab(out_rgb)[..., 1:]
+    return {
+        'psnr': psnr(orig, out_rgb, data_range=1.0),
+        'ssim': ssim(orig, out_rgb, data_range=1.0, channel_axis=2),
+        'ab_mae': np.abs(ab_out - ab_orig).mean(),
+        'saturation': np.abs(ab_out).mean(),
+    }
 
 
 def test_models_load():
@@ -45,64 +67,63 @@ def test_models_load():
 
 
 def test_output_shape(model_eccv16, model_siggraph17):
-    img = load_img(TEST_IMAGE)
+    img = load_img(TEST_IMAGES[0])
     tens_l_orig, tens_l_rs = preprocess_img(img, HW=(256, 256))
 
     with torch.no_grad():
         out_eccv16 = model_eccv16(tens_l_rs)
         out_siggraph17 = model_siggraph17(tens_l_rs)
 
-    assert out_eccv16.shape[1] == 2, f"eccv16: ожидается 2 канала ab, получено {out_eccv16.shape[1]}"
-    assert out_siggraph17.shape[1] == 2, f"siggraph17: ожидается 2 канала ab, получено {out_siggraph17.shape[1]}"
+    for name, out in [('eccv16', out_eccv16), ('siggraph17', out_siggraph17)]:
+        assert tuple(out.shape) == (1, 2, 256, 256), \
+            f"{name}: ожидается форма (1, 2, 256, 256), получено {tuple(out.shape)}"
     print(f"[PASS] Форма выхода eccv16: {tuple(out_eccv16.shape)}, siggraph17: {tuple(out_siggraph17.shape)}")
 
 
 def test_colorization_quality(model_eccv16, model_siggraph17):
-    img = load_img(TEST_IMAGE)
-    tens_l_orig, tens_l_rs = preprocess_img(img, HW=(256, 256))
+    models = {'gray (baseline)': None, 'eccv16': model_eccv16, 'siggraph17': model_siggraph17}
+    scores = {name: [] for name in models}
 
-    out_eccv16 = colorize(model_eccv16, tens_l_orig, tens_l_rs)
-    out_siggraph17 = colorize(model_siggraph17, tens_l_orig, tens_l_rs)
+    for path in TEST_IMAGES:
+        img = load_img(path)
+        tens_l_orig, tens_l_rs = preprocess_img(img, HW=(256, 256))
+        for name, model in models.items():
+            out = gray_baseline(tens_l_orig) if model is None else colorize(model, tens_l_orig, tens_l_rs)
+            scores[name].append(evaluate(img, out))
 
-    # Привести оригинал к тому же размеру что и выход
-    from PIL import Image
-    import numpy as np
-    orig_resized = np.array(Image.fromarray((img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)).resize(
-        (out_eccv16.shape[1], out_eccv16.shape[0]))) / 255.0
+    mean = {name: {k: np.mean([s[k] for s in per_img]) for k in per_img[0]}
+            for name, per_img in scores.items()}
 
-    out_eccv16_f = out_eccv16.astype(np.float64)
-    out_siggraph17_f = out_siggraph17.astype(np.float64)
-    orig_f = (orig_resized * 255).astype(np.float64) if orig_resized.max() <= 1.0 else orig_resized.astype(np.float64)
-    out_eccv16_255 = (out_eccv16_f * 255) if out_eccv16_f.max() <= 1.0 else out_eccv16_f
-    out_siggraph17_255 = (out_siggraph17_f * 255) if out_siggraph17_f.max() <= 1.0 else out_siggraph17_f
-
-    psnr_eccv16 = psnr(orig_f, out_eccv16_255, data_range=255)
-    psnr_siggraph17 = psnr(orig_f, out_siggraph17_255, data_range=255)
-    ssim_eccv16 = ssim(orig_f, out_eccv16_255, data_range=255, channel_axis=2)
-    ssim_siggraph17 = ssim(orig_f, out_siggraph17_255, data_range=255, channel_axis=2)
-
-    print(f"\n  {'Модель':<15} {'PSNR (дБ)':<12} {'SSIM':<8} {'Порог PSNR':<12} {'Порог SSIM'}")
+    print(f"\n  Среднее по {len(TEST_IMAGES)} цветным изображениям:")
+    print(f"  {'Модель':<17} {'PSNR (дБ)':<11} {'SSIM':<8} {'ab MAE':<9} {'|ab|'}")
     print(f"  {'-'*55}")
-    print(f"  {'eccv16':<15} {psnr_eccv16:<12.2f} {ssim_eccv16:<8.3f} {PSNR_THRESHOLD:<12} {SSIM_THRESHOLD}")
-    print(f"  {'siggraph17':<15} {psnr_siggraph17:<12.2f} {ssim_siggraph17:<8.3f} {PSNR_THRESHOLD:<12} {SSIM_THRESHOLD}")
+    for name, m in mean.items():
+        print(f"  {name:<17} {m['psnr']:<11.2f} {m['ssim']:<8.3f} {m['ab_mae']:<9.2f} {m['saturation']:.2f}")
 
-    assert psnr_eccv16 >= PSNR_THRESHOLD, f"eccv16 PSNR {psnr_eccv16:.2f} < {PSNR_THRESHOLD}"
-    assert psnr_siggraph17 >= PSNR_THRESHOLD, f"siggraph17 PSNR {psnr_siggraph17:.2f} < {PSNR_THRESHOLD}"
-    assert ssim_eccv16 >= SSIM_THRESHOLD, f"eccv16 SSIM {ssim_eccv16:.3f} < {SSIM_THRESHOLD}"
-    assert ssim_siggraph17 >= SSIM_THRESHOLD, f"siggraph17 SSIM {ssim_siggraph17:.3f} < {SSIM_THRESHOLD}"
-    print(f"[PASS] Качество колоризации выше порогов (PSNR>{PSNR_THRESHOLD}, SSIM>{SSIM_THRESHOLD})")
+    baseline_mae = mean['gray (baseline)']['ab_mae']
+    for name in ('eccv16', 'siggraph17'):
+        m = mean[name]
+        assert m['psnr'] >= PSNR_THRESHOLD, f"{name} PSNR {m['psnr']:.2f} < {PSNR_THRESHOLD}"
+        assert m['ssim'] >= SSIM_THRESHOLD, f"{name} SSIM {m['ssim']:.3f} < {SSIM_THRESHOLD}"
+        assert m['saturation'] >= SATURATION_THRESHOLD, \
+            f"{name} почти не добавляет цвет: |ab| {m['saturation']:.2f} < {SATURATION_THRESHOLD}"
+        gain = 1 - m['ab_mae'] / baseline_mae
+        assert gain >= AB_GAIN_THRESHOLD, \
+            f"{name} ab MAE {m['ab_mae']:.2f} лишь на {gain:.0%} лучше серого baseline ({baseline_mae:.2f})"
+        print(f"[PASS] {name}: ab MAE на {gain:.0%} лучше серого baseline, "
+              f"PSNR>{PSNR_THRESHOLD}, SSIM>{SSIM_THRESHOLD}")
 
 
 def test_reproducibility(model_eccv16):
+    img = load_img(TEST_IMAGES[0])
+
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-    img = load_img(TEST_IMAGE)
     tens_l_orig, tens_l_rs = preprocess_img(img, HW=(256, 256))
     out1 = colorize(model_eccv16, tens_l_orig, tens_l_rs)
 
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-    img = load_img(TEST_IMAGE)
     tens_l_orig, tens_l_rs = preprocess_img(img, HW=(256, 256))
     out2 = colorize(model_eccv16, tens_l_orig, tens_l_rs)
 
@@ -113,7 +134,7 @@ def test_reproducibility(model_eccv16):
 def main():
     print("=" * 60)
     print("Colorful Image Colorization - RunCheckerTest")
-    print(f"Изображение: {TEST_IMAGE} | Seed: {SEED}")
+    print(f"Изображения: {len(TEST_IMAGES)} шт. из imgs/ | Seed: {SEED}")
     print("=" * 60)
 
     failed = 0
@@ -142,11 +163,12 @@ def main():
             print(f"[ERROR] {e}")
             failed += 1
 
+    total = len(tests) + 1
     print("\n" + "=" * 60)
     if failed == 0:
-        print(f"Все {len(tests) + 1} теста пройдены успешно.")
+        print(f"Все {total} теста пройдены успешно.")
     else:
-        print(f"{failed}/{len(tests)} тестов НЕ пройдено.")
+        print(f"{failed}/{total} тестов НЕ пройдено.")
         sys.exit(1)
 
 
